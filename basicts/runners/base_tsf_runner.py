@@ -1,0 +1,520 @@
+import math
+import functools
+from typing import Tuple, Union, Optional, List
+
+import torch
+import numpy as np
+from easydict import EasyDict
+from easytorch.utils.dist import master_only
+
+from .base_runner import BaseRunner
+from ..data import SCALER_REGISTRY
+from ..utils import load_pkl
+from ..metrics import masked_mae, masked_mape, masked_rmse, masked_wape, masked_mse
+
+
+class BaseTimeSeriesForecastingRunner(BaseRunner):
+    """
+    Runner for multivariate time series forecasting datasets.
+    Features:
+        - Evaluate at pre-defined horizons (1~12 as default) and overall.
+        - Metrics: MAE, RMSE, MAPE. Allow customization. The best model is the one with the smallest mae at validation.
+        - Support setup_graph for the models acting like tensorflow.
+        - Loss: MAE (masked_mae) as default. Allow customization.
+        - Support curriculum learning.
+        - Users only need to implement the `forward` function.
+    """
+
+    def __init__(self, cfg: dict):
+        super().__init__(cfg)
+        # ✅ 保存配置到实例属性
+        self.cfg = cfg  # 添加这一行
+        self.dataset_name = cfg["DATASET_NAME"]
+        # different datasets have different null_values, e.g., 0.0 or np.nan.
+        self.null_val = cfg.get("NULL_VAL", np.nan)    # consist with metric functions
+        self.dataset_type = cfg.get("DATASET_TYPE", " ")
+        self.if_rescale = cfg.get("RESCALE", True)   # if rescale data when calculating loss or metrics, default as True
+        # ✅ 添加对比学习支持
+        self.use_contrastive = cfg["MODEL"].get("USE_CONTRASTIVE_LOSS", False)
+        # setup graph
+        self.need_setup_graph = cfg["MODEL"].get("SETUP_GRAPH", False)
+
+        # read scaler for re-normalization
+        self.scaler = load_pkl("{0}/scaler_in_{1}_out_{2}_rescale_{3}.pkl".format(
+            cfg["TRAIN"]["DATA"]["DIR"],
+            cfg["DATASET_INPUT_LEN"],
+            cfg["DATASET_OUTPUT_LEN"],
+            cfg.get("RESCALE", True)))
+        # define loss
+        self.loss = cfg["TRAIN"]["LOSS"]
+        # define metric
+        self.metrics = cfg.get("METRICS", {"MAE": masked_mae, "RMSE": masked_rmse, "MAPE": masked_mape, "WAPE": masked_wape, "MSE": masked_mse})
+        # curriculum learning for output. Note that this is different from the CL in Seq2Seq archs.
+        self.cl_param = cfg["TRAIN"].get("CL", None)
+        if self.cl_param is not None:
+            self.warm_up_epochs = cfg["TRAIN"].CL.get("WARM_EPOCHS", 0)
+            self.cl_epochs = cfg["TRAIN"].CL.get("CL_EPOCHS")
+            self.prediction_length = cfg["TRAIN"].CL.get("PREDICTION_LENGTH")
+            self.cl_step_size = cfg["TRAIN"].CL.get("STEP_SIZE", 1)
+        # evaluation
+        self.if_evaluate_on_gpu = cfg.get("EVAL", EasyDict()).get("USE_GPU", True)     # evaluate on gpu or cpu (gpu is faster but may cause OOM)
+        self.evaluation_horizons = [_ - 1 for _ in cfg.get("EVAL", EasyDict()).get("HORIZONS", range(1, 13))]
+        assert min(self.evaluation_horizons) >= 0, "The horizon should start counting from 1."
+
+    def setup_graph(self, cfg: dict, train: bool):
+        """Setup all parameters and the computation graph.
+        Implementation of many works (e.g., DCRNN, GTS) acts like TensorFlow, which creates parameters in the first feedforward process.
+
+        Args:
+            cfg (dict): config
+            train (bool): training or inferencing
+        """
+
+        dataloader = self.build_test_data_loader(cfg=cfg) if not train else self.build_train_data_loader(cfg=cfg)
+        data = next(enumerate(dataloader))[1] # get the first batch
+        self.forward(data=data, epoch=1, iter_num=0, train=train)
+
+    def count_parameters(self):
+        """Count the number of parameters in the model."""
+
+        num_parameters = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+        self.logger.info("Number of parameters: {0}".format(num_parameters))
+
+    def init_training(self, cfg: dict):
+        """Initialize training.
+
+        Including loss, training meters, etc.
+
+        Args:
+            cfg (dict): config
+        """
+
+        # setup graph
+        if self.need_setup_graph:
+            self.setup_graph(cfg=cfg, train=True)
+            self.need_setup_graph = False
+        # init training
+        super().init_training(cfg)
+        # count parameters
+        self.count_parameters()
+        for key, _ in self.metrics.items():
+            self.register_epoch_meter("train_"+key, "train", "{:.6f}")
+
+    def init_validation(self, cfg: dict):
+        """Initialize validation.
+
+        Including validation meters, etc.
+
+        Args:
+            cfg (dict): config
+        """
+
+        super().init_validation(cfg)
+        for key, _ in self.metrics.items():
+            self.register_epoch_meter("val_"+key, "val", "{:.6f}")
+
+    def init_test(self, cfg: dict):
+        """Initialize test.
+
+        Including test meters, etc.
+
+        Args:
+            cfg (dict): config
+        """
+
+        if self.need_setup_graph:
+            self.setup_graph(cfg=cfg, train=False)
+            self.need_setup_graph = False
+        super().init_test(cfg)
+        for key, _ in self.metrics.items():
+            self.register_epoch_meter("test_"+key, "test", "{:.6f}")
+
+    def build_train_dataset(self, cfg: dict):
+        """Build train dataset
+
+            There are two types of preprocessing methods in BasicTS,
+                1. Normalize across the WHOLE dataset.
+                2. Normalize on EACH channel (i.e., calculate the mean and std of each channel).
+
+            The reason why there are two different preprocessing methods is that each channel of the dataset may have a different value range.
+                1. Normalizing the WHOLE data set will preserve the relative size relationship between channels.
+                   Larger channels usually produce larger loss values, so more attention will be paid to these channels when optimizing the model.
+                   Therefore, this approach will achieve better performance when we evaluate on the rescaled dataset.
+                   For example, when evaluating rescaled data for two channels with values in the range [0, 1], [9000, 10000], the prediction on channel [0,1] is trivial.
+                2. Normalizing each channel will eliminate the gap in value range between channels.
+                   For example, a channel with a value in the range [0, 1] may be as important as a channel with a value in the range [9000, 10000].
+                   In this case we need to normalize each channel and evaluate without rescaling.
+
+            There is no absolute good or bad distinction between the above two situations,
+                  and the decision needs to be made based on actual requirements or academic research habits.
+            For example, the first approach is often adopted in the field of Spatial-Temporal Forecasting (STF).
+            The second approach is often adopted in the field of Long-term Time Series Forecasting (LTSF).
+
+            To avoid confusion for users and facilitate them to obtain results comparable to existing studies, we
+            automatically select data based on the cfg.get("RESCALE") flag (default to True).
+            if_rescale == True: use the data that is normalized across the WHOLE dataset
+            if_rescale == False: use the data that is normalized on EACH channel
+
+        Args:
+            cfg (dict): config
+
+        Returns:
+            train dataset (Dataset)
+        """
+        data_file_path = "{0}/data_in_{1}_out_{2}_rescale_{3}.pkl".format(
+            cfg["TRAIN"]["DATA"]["DIR"],
+            cfg["DATASET_INPUT_LEN"],
+            cfg["DATASET_OUTPUT_LEN"],
+            cfg.get("RESCALE", True))
+        index_file_path = "{0}/index_in_{1}_out_{2}_rescale_{3}.pkl".format(
+            cfg["TRAIN"]["DATA"]["DIR"],
+            cfg["DATASET_INPUT_LEN"],
+            cfg["DATASET_OUTPUT_LEN"],
+            cfg.get("RESCALE", True))
+
+        # build dataset args
+        dataset_args = cfg.get("DATASET_ARGS", {})
+        # three necessary arguments, data file path, corresponding index file path, and mode (train, valid, or test)
+        dataset_args["data_file_path"] = data_file_path
+        dataset_args["index_file_path"] = index_file_path
+        dataset_args["mode"] = "train"
+
+        dataset = cfg["DATASET_CLS"](**dataset_args)
+        print("train len: {0}".format(len(dataset)))
+
+        batch_size = cfg["TRAIN"]["DATA"]["BATCH_SIZE"]
+        self.iter_per_epoch = math.ceil(len(dataset) / batch_size)
+
+        return dataset
+
+    @staticmethod
+    def build_val_dataset(cfg: dict):
+        """Build val dataset
+
+        Args:
+            cfg (dict): config
+
+        Returns:
+            validation dataset (Dataset)
+        """
+        # see build_train_dataset for details
+        data_file_path = "{0}/data_in_{1}_out_{2}_rescale_{3}.pkl".format(
+            cfg["VAL"]["DATA"]["DIR"],
+            cfg["DATASET_INPUT_LEN"],
+            cfg["DATASET_OUTPUT_LEN"],
+            cfg.get("RESCALE", True))
+        index_file_path = "{0}/index_in_{1}_out_{2}_rescale_{3}.pkl".format(
+            cfg["VAL"]["DATA"]["DIR"],
+            cfg["DATASET_INPUT_LEN"],
+            cfg["DATASET_OUTPUT_LEN"],
+            cfg.get("RESCALE", True))
+
+        # build dataset args
+        dataset_args = cfg.get("DATASET_ARGS", {})
+        # three necessary arguments, data file path, corresponding index file path, and mode (train, valid, or test)
+        dataset_args["data_file_path"] = data_file_path
+        dataset_args["index_file_path"] = index_file_path
+        dataset_args["mode"] = "valid"
+
+        dataset = cfg["DATASET_CLS"](**dataset_args)
+        print("val len: {0}".format(len(dataset)))
+
+        return dataset
+
+    @staticmethod
+    def build_test_dataset(cfg: dict):
+        """Build val dataset
+
+        Args:
+            cfg (dict): config
+
+        Returns:
+            train dataset (Dataset)
+        """
+        data_file_path = "{0}/data_in_{1}_out_{2}_rescale_{3}.pkl".format(
+            cfg["TEST"]["DATA"]["DIR"],
+            cfg["DATASET_INPUT_LEN"],
+            cfg["DATASET_OUTPUT_LEN"],
+            cfg.get("RESCALE", True))
+        index_file_path = "{0}/index_in_{1}_out_{2}_rescale_{3}.pkl".format(
+            cfg["TEST"]["DATA"]["DIR"],
+            cfg["DATASET_INPUT_LEN"],
+            cfg["DATASET_OUTPUT_LEN"],
+            cfg.get("RESCALE", True))
+
+        # build dataset args
+        dataset_args = cfg.get("DATASET_ARGS", {})
+        # three necessary arguments, data file path, corresponding index file path, and mode (train, valid, or test)
+        dataset_args["data_file_path"] = data_file_path
+        dataset_args["index_file_path"] = index_file_path
+        dataset_args["mode"] = "test"
+
+        dataset = cfg["DATASET_CLS"](**dataset_args)
+        print("test len: {0}".format(len(dataset)))
+
+        return dataset
+
+    def curriculum_learning(self, epoch: int = None) -> int:
+        """Calculate task level in curriculum learning.
+
+        Args:
+            epoch (int, optional): current epoch if in training process, else None. Defaults to None.
+
+        Returns:
+            int: task level
+        """
+
+        if epoch is None:
+            return self.prediction_length
+        epoch -= 1
+        # generate curriculum length
+        if epoch < self.warm_up_epochs:
+            # still warm up
+            cl_length = self.prediction_length
+        else:
+            _ = ((epoch - self.warm_up_epochs) // self.cl_epochs + 1) * self.cl_step_size
+            cl_length = min(_, self.prediction_length)
+        return cl_length
+
+    def forward(self, data: tuple, epoch: int = None, iter_num: int = None, train: bool = True, **kwargs) -> tuple:
+        """Feed forward process for train, val, and test. Note that the outputs are NOT re-scaled.
+
+        Args:
+            data (tuple): data (future data, history data). [B, L, N, C] for each of them
+            epoch (int, optional): epoch number. Defaults to None.
+            iter_num (int, optional): iteration number. Defaults to None.
+            train (bool, optional): if in the training process. Defaults to True.
+
+        Returns:
+            tuple: (prediction, real_value). [B, L, N, C] for each of them.
+        """
+
+        raise NotImplementedError()
+
+    def metric_forward(self, metric_func, args):
+        """Computing metrics.
+
+        Args:
+            metric_func (function, functools.partial): metric function.
+            args (list): arguments for metrics computation.
+        """
+
+        if isinstance(metric_func, functools.partial) and list(metric_func.keywords.keys()) == ["null_val"]:
+            # support partial(metric_func, null_val = something)
+            metric_item = metric_func(*args)
+        elif callable(metric_func):
+            # is a function
+            metric_item = metric_func(*args, null_val=self.null_val)
+        else:
+            raise TypeError("Unknown metric type: {0}".format(type(metric_func)))
+        return metric_item
+
+    def rescale_data(self, input_data: List[torch.Tensor]) -> List[torch.Tensor]:
+        """Rescale data.
+
+        Args:
+            data (List[torch.Tensor]): list of data to be re-scaled.
+
+        Returns:
+            List[torch.Tensor]: list of re-scaled data.
+        """
+
+        # prediction, real_value = input_data[:2]
+        if self.if_rescale:
+            input_data[0] = SCALER_REGISTRY.get(self.scaler["func"])(input_data[0], **self.scaler["args"])
+            input_data[1] = SCALER_REGISTRY.get(self.scaler["func"])(input_data[1], **self.scaler["args"])
+        return input_data
+
+    # def train_iters(self, epoch: int, iter_index: int, data: Union[torch.Tensor, Tuple]) -> torch.Tensor:
+    #     """Training details.
+    #
+    #     Args:
+    #         data (Union[torch.Tensor, Tuple]): Data provided by DataLoader
+    #         epoch (int): current epoch.
+    #         iter_index (int): current iter.
+    #
+    #     Returns:
+    #         loss (torch.Tensor)
+    #     """
+    #
+    #     iter_num = (epoch-1) * self.iter_per_epoch + iter_index
+    #     forward_return = list(self.forward(data=data, epoch=epoch, iter_num=iter_num, train=True))
+    #     # re-scale data
+    #     forward_return = self.rescale_data(forward_return)
+    #     # loss
+    #     if self.cl_param:
+    #         cl_length = self.curriculum_learning(epoch=epoch)
+    #         forward_return[0] = forward_return[0][:, :cl_length, :, :] # prediction
+    #         forward_return[1] = forward_return[1][:, :cl_length, :, :] # real_value
+    #     loss = self.metric_forward(self.loss, forward_return)
+    #     # metrics
+    #     for metric_name, metric_func in self.metrics.items():
+    #         metric_item = self.metric_forward(metric_func, forward_return[:2])
+    #         self.update_epoch_meter("train_"+metric_name, metric_item.item())
+    #     return loss
+    def train_iters(self, epoch: int, iter_index: int, data: Union[torch.Tensor, Tuple]) -> torch.Tensor:
+        """Training details with contrastive learning support and debugging.
+
+        Args:
+            data (Union[torch.Tensor, Tuple]): Data provided by DataLoader
+            epoch (int): current epoch.
+            iter_index (int): current iter.
+
+        Returns:
+            loss (torch.Tensor)
+        """
+
+        iter_num = (epoch - 1) * self.iter_per_epoch + iter_index
+        forward_return = list(self.forward(data=data, epoch=epoch, iter_num=iter_num, train=True))
+        # re-scale data
+        forward_return = self.rescale_data(forward_return)
+        # curriculum learning
+        if self.cl_param:
+            cl_length = self.curriculum_learning(epoch=epoch)
+            forward_return[0] = forward_return[0][:, :cl_length, :, :]  # prediction
+            forward_return[1] = forward_return[1][:, :cl_length, :, :]  # real_value
+
+        # ========== ✅ 主损失 ========== #
+        main_loss = self.metric_forward(self.loss, forward_return)  # ✅ 保存主损失用于监控
+
+        # ========== ✅ 对比学习损失（加权 + 监控） ========== #
+        total_contrastive_loss = torch.tensor(0.0, device=main_loss.device, requires_grad=True)
+        if hasattr(self, 'use_contrastive') and self.use_contrastive:
+            if hasattr(self.model, '_last_contrastive_losses'):
+                contrastive_losses = self.model._last_contrastive_losses
+
+                # ✅ 从配置中获取权重（默认 0.1，避免硬编码）
+                beta1 = self.cfg["MODEL"].get("PARAM", {}).get("beta1", 0.1)  # 三元组权重
+                beta2 = self.cfg["MODEL"].get("PARAM", {}).get("beta2", 0.1)  # 一致性权重
+
+                triplet_loss_val = 0.0
+                consistency_loss_val = 0.0
+
+                # 累加三元组损失（加权）
+                if 'triplet_loss' in contrastive_losses:
+                    triplet_loss = contrastive_losses['triplet_loss']
+                    if isinstance(triplet_loss, torch.Tensor) and triplet_loss.requires_grad:
+                        # ✅ 防护：clamp 避免 NaN/Inf
+                        triplet_loss = torch.clamp(triplet_loss, min=-10.0, max=10.0)
+                        total_contrastive_loss = total_contrastive_loss + beta1 * triplet_loss
+                        triplet_loss_val = triplet_loss.item()
+
+                # 累加一致性损失（加权）
+                if 'consistency_loss' in contrastive_losses:
+                    consistency_loss = contrastive_losses['consistency_loss']
+                    if isinstance(consistency_loss, torch.Tensor) and consistency_loss.requires_grad:
+                        # ✅ 防护：clamp 避免 NaN/Inf
+                        consistency_loss = torch.clamp(consistency_loss, min=-10.0, max=10.0)
+                        total_contrastive_loss = total_contrastive_loss + beta2 * consistency_loss
+                        consistency_loss_val = consistency_loss.item()
+
+                # ✅ 梯度检查（仅调试时，每 100 iter 打印一次）
+                if iter_index % 100 == 0 and iter_num > 0:  # 避免第一 iter 打印
+                    has_grad = total_contrastive_loss.requires_grad
+                    self.logger.info(
+                        f"Epoch {epoch}, Iter {iter_index}: "
+                        f"Main Loss: {main_loss.item():.4f}, "
+                        f"Triplet (beta1={beta1}): {triplet_loss_val:.4f}, "
+                        f"Consistency (beta2={beta2}): {consistency_loss_val:.4f}, "
+                        f"Total Contrastive: {total_contrastive_loss.item():.4f}, "
+                        f"Has Grad: {has_grad}"
+                    )
+                    if not has_grad:
+                        self.logger.warning("WARNING: Contrastive Loss has NO gradient! Check model forward.")
+
+                # ✅ 可选：TensorBoard 记录（如果框架支持，在 init_training 中初始化 writer）
+                # if hasattr(self, 'writer'):
+                #     self.writer.add_scalar('Loss/Main', main_loss.item(), global_step=iter_num)
+                #     self.writer.add_scalar('Loss/Contrastive', total_contrastive_loss.item(), global_step=iter_num)
+
+        # ✅ 总损失（主 + 对比）
+        loss = main_loss + total_contrastive_loss
+
+        # metrics
+        for metric_name, metric_func in self.metrics.items():
+            metric_item = self.metric_forward(metric_func, forward_return[:2])
+            self.update_epoch_meter("train_" + metric_name, metric_item.item())
+
+        # ✅ 最终防护：clamp 总损失避免爆炸
+        loss = torch.clamp(loss, min=0.0)  # 损失不应为负
+        return loss
+
+    def val_iters(self, iter_index: int, data: Union[torch.Tensor, Tuple]):
+        """Validation details.
+
+        Args:
+            iter_index (int): current iter.
+            data (Union[torch.Tensor, Tuple]): Data provided by DataLoader
+        """
+
+        forward_return = list(self.forward(data=data, epoch=None, iter_num=iter_index, train=False))
+        # re-scale data
+        forward_return = self.rescale_data(forward_return)
+        # metrics
+        for metric_name, metric_func in self.metrics.items():
+            metric_item = self.metric_forward(metric_func, forward_return[:2])
+            self.update_epoch_meter("val_"+metric_name, metric_item.item())
+
+    def evaluate(self, prediction, real_value):
+        """Evaluate the model on test data.
+
+        Args:
+            prediction (torch.Tensor): prediction data [B, L, N, C].
+            real_value (torch.Tensor): ground truth [B, L, N, C].
+        """
+
+        # test performance of different horizon
+        for i in self.evaluation_horizons:
+            # For horizon i, only calculate the metrics **at that time** slice here.
+            pred = prediction[:, i, :, :]
+            real = real_value[:, i, :, :]
+            # metrics
+            metric_repr = ""
+            for metric_name, metric_func in self.metrics.items():
+                metric_item = self.metric_forward(metric_func, [pred, real])
+                metric_repr += ", Test {0}: {1:.6f}".format(metric_name, metric_item.item())
+            log = "Evaluate best model on test data for horizon {:d}" + metric_repr
+            log = log.format(i+1)
+            self.logger.info(log)
+        # test performance overall
+        for metric_name, metric_func in self.metrics.items():
+            metric_item = self.metric_forward(metric_func, [prediction, real_value])
+            self.update_epoch_meter("test_"+metric_name, metric_item.item())
+
+    @torch.no_grad()
+    @master_only
+    def test(self):
+        """Evaluate the model.
+
+        Args:
+            train_epoch (int, optional): current epoch if in training process.
+        """
+
+        # test loop
+        prediction = []
+        real_value = []
+        for _, data in enumerate(self.test_data_loader):
+            forward_return = list(self.forward(data, epoch=None, iter_num=None, train=False))
+            if not self.if_evaluate_on_gpu:
+                forward_return[0], forward_return[1] = forward_return[0].detach().cpu(), forward_return[1].detach().cpu()
+            prediction.append(forward_return[0])        # preds = forward_return[0]
+            real_value.append(forward_return[1])        # testy = forward_return[1]
+        prediction = torch.cat(prediction, dim=0)
+        real_value = torch.cat(real_value, dim=0)
+        # re-scale data
+        if self.if_rescale:
+            prediction = SCALER_REGISTRY.get(self.scaler["func"])(prediction, **self.scaler["args"])
+            real_value = SCALER_REGISTRY.get(self.scaler["func"])(real_value, **self.scaler["args"])
+        # evaluate
+        self.evaluate(prediction, real_value)
+
+    @master_only
+    def on_validating_end(self, train_epoch: Optional[int]):
+        """Callback at the end of validating.
+
+        Args:
+            train_epoch (Optional[int]): current epoch if in training process.
+        """
+
+        if train_epoch is not None:
+            self.save_best_model(train_epoch, "val_MAE", greater_best=False)
